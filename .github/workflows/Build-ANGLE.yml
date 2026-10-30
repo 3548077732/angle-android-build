@@ -1,0 +1,361 @@
+name: Build ANGLE-a
+
+on:
+  push:
+    branches: [ main ]                      # 注意：原稿写成了 banches
+  schedule:
+    - cron: '0 */4 * * *'                   # 每 4 小时检查一次上游
+  workflow_dispatch:                        # ===== 手动触发 =====
+    inputs:
+      force_build:
+        description: '即使没有新 commit 也强制构建'
+        required: false
+        default: false
+        type: boolean
+      target_cpu:
+        description: '目标架构 (arm64 / arm / x64)'
+        required: false
+        default: 'arm64'
+        type: choice
+        options:
+          - arm64
+          - arm
+          - x64
+      build_type:
+        description: '构建类型'
+        required: false
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+      custom_tag:
+        description: '自定义 release 标签（留空则使用 nightly）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write                           # 创建/删除 release、打 tag
+
+concurrency:
+  group: angle-build-${{ github.workflow }}
+  cancel-in-progress: false                 # 构建耗时长，不要中途取消
+
+env:
+  DEPOT_TOOLS_PATH: ${{ github.workspace }}/depot_tools
+  ANGLE_ROOT: ${{ github.workspace }}/angle
+  DEPOT_TOOLS_UPDATE: 0                     # 防止 depot_tools 自行更新导致不一致
+  PYTHONUNBUFFERED: 1
+  CI: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) 检查上游是否有新提交
+  # ---------------------------------------------------------------------------
+  check-updates:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+      commit: ${{ steps.check.outputs.commit }}
+      short: ${{ steps.check.outputs.short }}
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Compute release tag
+        id: tag
+        run: |
+          if [[ -n "${{ github.event.inputs.custom_tag }}" ]]; then
+            echo "tag=${{ github.event.inputs.custom_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=nightly" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check for new ANGLE commits
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          LATEST_COMMIT=$(git ls-remote https://chromium.googlesource.com/angle/angle.git \
+                          refs/heads/main | awk '{print $1}')
+          if [[ -z "$LATEST_COMMIT" ]]; then
+            echo "::error::无法获取上游 main 分支的 commit，请检查网络"
+            exit 1
+          fi
+          SHORT="${LATEST_COMMIT:0:12}"
+          echo "commit=$LATEST_COMMIT" >> $GITHUB_OUTPUT
+          echo "short=$SHORT" >> $GITHUB_OUTPUT
+          echo "上游最新 commit: $SHORT"
+
+          FORCE_BUILD="${{ github.event.inputs.force_build }}"
+          if [[ "$FORCE_BUILD" == "true" ]]; then
+            echo "手动触发：强制构建"
+            echo "skip=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          PREV_COMMIT=""
+          TAG="${{ steps.tag.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            PREV_COMMIT=$(gh release view "$TAG" --json body -q .body \
+                           | sed -n 's/.*Commit:.*\]\(https:\/\/[^)]*\).*/\1/p' \
+                           | grep -oE '[a-f0-9]{40}' | head -n1 || true)
+            # 兜底：从 body 第一行提取 hash
+            if [[ -z "$PREV_COMMIT" ]]; then
+              PREV_COMMIT=$(gh release view "$TAG" --json body -q .body \
+                             | grep -oE '[a-f0-9]{40}' | head -n1 || true)
+            fi
+          fi
+
+          if [[ "$LATEST_COMMIT" == "$PREV_COMMIT" ]]; then
+            echo "没有新提交，跳过构建 (commit=$SHORT)"
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "发现新提交：$PREV_COMMIT -> $SHORT，开始构建"
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+  # ---------------------------------------------------------------------------
+  # 2) 构建 ANGLE
+  # ---------------------------------------------------------------------------
+  build-angle:
+    needs: check-updates
+    if: needs.check-updates.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      TARGET_CPU: ${{ github.event.inputs.target_cpu || 'arm64' }}
+      BUILD_TYPE: ${{ github.event.inputs.build_type || 'release' }}
+      LATEST_COMMIT: ${{ needs.check-updates.outputs.commit }}
+      RELEASE_TAG: ${{ needs.check-updates.outputs.tag }}
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Free disk space (ANGLE + Android 工具链体积很大)
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af || true
+          df -h
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git curl python3 python3-pip \
+            openjdk-17-jdk-headless \
+            ninja-build \
+            p7zip-full                        # 原稿缺少 7z，会导致打包步骤失败
+
+      - name: Setup JDK
+        run: |
+          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: latest
+          accept-android-sdk-licenses: true
+
+      - name: Cache depot_tools
+        id: cache-depot
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.DEPOT_TOOLS_PATH }}
+          key: depot-tools-${{ runner.os }}-v1
+          restore-keys: depot-tools-${{ runner.os }}-
+
+      - name: Fetch depot_tools
+        if: steps.cache-depot.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 \
+            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
+            "$DEPOT_TOOLS_PATH"
+
+      - name: Add depot_tools to PATH
+        run: echo "$DEPOT_TOOLS_PATH" >> $GITHUB_PATH
+
+      - name: Configure git
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "ANGLE-CI"
+          git config --global core.longpaths true
+
+      - name: Fetch ANGLE source
+        run: |
+          set -euo pipefail
+          mkdir -p "$ANGLE_ROOT"
+          cd "$ANGLE_ROOT"
+
+          cat > .gclient << 'EOF'
+          solutions = [
+            {
+              "name": ".",
+              "url": "https://chromium.googlesource.com/angle/angle.git@refs/heads/main",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_deps": {},
+              "custom_vars": {},
+            },
+          ]
+          target_os = ["android"]
+          EOF
+
+          # 网络波动重试
+          for i in 1 2 3; do
+            gclient sync --no-history && break
+            echo "gclient sync 第 $i 次失败，5 秒后重试..."
+            sleep 5
+          done
+
+      - name: Write GN args
+        run: |
+          set -euo pipefail
+          cd "$ANGLE_ROOT"
+          mkdir -p out/Android
+
+          IS_DEBUG="false"
+          [[ "$BUILD_TYPE" == "debug" ]] && IS_DEBUG="true"
+
+          cat > out/Android/args.gn << EOF
+          target_os = "android"
+          target_cpu = "$TARGET_CPU"
+          is_debug = $IS_DEBUG
+          is_component_build = false
+          symbol_level = 0
+          strip_debug_info = true
+
+          angle_enable_vulkan = true
+          angle_enable_gl = false
+          angle_enable_vulkan_validation_layers = false
+          angle_enable_vulkan_api_dump_layer = false
+          angle_enable_trace = false
+          angle_enable_trace_events = false
+          angle_enable_platform_trace_events = false
+          angle_always_log_info = false
+          angle_assert_always_on = false
+          dcheck_always_on = false
+          angle_build_all = false
+
+          use_rtti = false
+          use_thin_lto = true
+          thin_lto_enable_optimizations = true
+          use_lld = true
+          use_goma = false
+          use_remoteexec = false
+          arm_control_flow_integrity = "none"
+          enable_resource_allowlist_generation = false
+          EOF
+
+          cat out/Android/args.gn
+          gn gen out/Android
+
+      - name: Build ANGLE APK
+        run: |
+          set -euo pipefail
+          cd "$ANGLE_ROOT"
+          autoninja -C out/Android angle_apks
+          ls -lh out/Android/apks/
+
+      # -----------------------------------------------------------------------
+      # 3) 打包 Magisk 模块 + 上传产物
+      # -----------------------------------------------------------------------
+      - name: Package module and publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHORT="${LATEST_COMMIT:0:12}"
+          TAG="$RELEASE_TAG"
+
+          # 提取版本号（容错：grep 不到就用默认值）
+          MAJOR=$(grep -m1 'ANGLE_MAJOR_VERSION' \
+                    "$ANGLE_ROOT/src/common/angle_version.h" | awk '{print $3}' || echo "")
+          MINOR=$(grep -m1 'ANGLE_MINOR_VERSION' \
+                    "$ANGLE_ROOT/src/common/angle_version.h" | awk '{print $3}' || echo "")
+          MAJOR=${MAJOR:-2}; MINOR=${MINOR:-1}; PATCH=1
+
+          VERSION_STR="$(date '+%F %T') (ANGLE ${MAJOR}.${MINOR}.${PATCH} git: $SHORT)"
+          TIMESTAMP="$(date +%s)"
+          ARCHIVE_NAME="AngleLibraries-${TARGET_CPU}-${SHORT}.zip"
+          APK_NAME="AngleLibraries-${TARGET_CPU}-${SHORT}.apk"
+
+          # 从 APK 中解压 so（路径随 GN 配置可能变化，先列出确认）
+          mkdir -p module/system/lib64
+          7z l "$ANGLE_ROOT/out/Android/apks/AngleLibraries.apk" | grep -i '\.so' || true
+          7z e -omodule/system/lib64/ -y \
+            "$ANGLE_ROOT/out/Android/apks/AngleLibraries.apk" \
+            "lib/arm64-v8a/libEGL_angle.so" \
+            "lib/arm64-v8a/libGLESv1_CM_angle.so" \
+            "lib/arm64-v8a/libGLESv2_angle.so" \
+            || { echo "::warning::7z 解压失败，请检查 APK 内 so 路径是否与 GN 配置匹配"; }
+
+          # 更新 module.prop（仓库中需预先存在 module/ 目录与 module.prop 模板）
+          if [[ -f module/module.prop ]]; then
+            sed -i "s/^version=.*/version=${VERSION_STR}/" module/module.prop
+            sed -i "s/^versionCode=.*/versionCode=${TIMESTAMP}/" module/module.prop
+          else
+            cat > module/module.prop << EOF
+          id=angle
+          name=ANGLE Vulkan Driver
+          version=${VERSION_STR}
+          versionCode=${TIMESTAMP}
+          author=CI
+          description=ANGLE built from chromium/angle@$SHORT
+          EOF
+          fi
+
+          # 打包
+          (cd module && 7z a -mm=xz -mx=9 "../$ARCHIVE_NAME" .)
+          cp "$ANGLE_ROOT/out/Android/apks/AngleLibraries.apk" "./$APK_NAME"
+
+          # 发布 release：先删旧的 nightly，再创建（非 nightly 标签则跳过删除）
+          if [[ "$TAG" == "nightly" ]]; then
+            gh release delete "$TAG" -y --cleanup-tag || true
+            sleep 2
+          fi
+          gh release create "$TAG" \
+            "./$ARCHIVE_NAME" \
+            "./$APK_NAME" \
+            --title "ANGLE ${MAJOR}.${MINOR}.${PATCH} · $SHORT" \
+            --notes "Commit: [\`${SHORT}\`](https://chromium.googlesource.com/angle/angle/+/${LATEST_COMMIT})
+          Version: ${VERSION_STR}
+          Timestamp: ${TIMESTAMP}
+          Target: android/${TARGET_CPU} (${BUILD_TYPE})
+          Triggered by: ${{ github.event_name }} (${{ github.actor }})" \
+            --prerelease
+
+          echo "ARTIFACT_ZIP=$ARCHIVE_NAME" >> $GITHUB_ENV
+          echo "ARTIFACT_APK=$APK_NAME" >> $GITHUB_ENV
+
+      - name: Upload ANGLE APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: angle-apk-${{ env.TARGET_CPU }}
+          path: ${{ env.ANGLE_ROOT }}/out/Android/apks/AngleLibraries.apk
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload Module Zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: angle-module-${{ env.TARGET_CPU }}
+          path: ${{ env.ARTIFACT_ZIP }}
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Write job summary
+        if: always()
+        run: |
+          SHORT="${LATEST_COMMIT:0:12}"
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ### Build result
+          | 项目 | 值 |
+          |---|---|
+          | Upstream commit | \`$SHORT\` |
+          | Target | android/$TARGET_CPU ($BUILD_TYPE) |
+          | Trigger | ${{ github.event_name }} |
+          | Release tag | $RELEASE_TAG |
+          EOF
